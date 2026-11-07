@@ -89,9 +89,25 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
         setReady(true);
       };
 
-      if (initialJson) {
+      // Prefer saved design from store (Edit/Use) over demo defaults
+      const st = useEditorStore.getState();
+      const stored =
+        initialJson ||
+        (st.side === "front" ? st.frontJson : st.backJson);
+
+      if (stored && stored !== "{}" && stored.length > 20) {
         isRestoringRef.current = true;
-        fc.loadFromJSON(initialJson, () => {
+        fc.loadFromJSON(stored, () => {
+          // ensure images load with CORS
+          fc!.getObjects().forEach((o) => {
+            if (o.type === "image") {
+              const img = o as import("fabric").fabric.Image;
+              try {
+                // @ts-expect-error fabric internal
+                if (img._element) img._element.crossOrigin = "anonymous";
+              } catch { /* ignore */ }
+            }
+          });
           fc!.renderAll();
           isRestoringRef.current = false;
           finishInit(serialize(fc!));
@@ -541,6 +557,52 @@ img{max-width:min(96vw,900px);max-height:92vh;border-radius:12px;box-shadow:0 16
       });
     };
 
+    const setPosition = (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        left?: number; top?: number; width?: number; height?: number; angle?: number;
+      };
+      const obj = c.getActiveObject();
+      if (!obj) return;
+      if (detail.left !== undefined) obj.set("left", detail.left);
+      if (detail.top !== undefined) obj.set("top", detail.top);
+      if (detail.angle !== undefined) obj.set("angle", detail.angle);
+      if (detail.width !== undefined && obj.type !== "circle") {
+        const scaleX = detail.width / Math.max(1, (obj.width || 1));
+        obj.set("scaleX", scaleX);
+      }
+      if (detail.height !== undefined && obj.type !== "circle") {
+        const scaleY = detail.height / Math.max(1, (obj.height || 1));
+        obj.set("scaleY", scaleY);
+      }
+      if (detail.width !== undefined && obj.type === "circle") {
+        const r = detail.width / 2;
+        (obj as import("fabric").fabric.Circle).set("radius", r / (obj.scaleX || 1));
+      }
+      obj.setCoords();
+      c.renderAll();
+      pushHistory(c);
+    };
+
+    const alignOnCanvas = (e: Event) => {
+      const where = (e as CustomEvent).detail as string;
+      const obj = c.getActiveObject();
+      if (!obj) return;
+      const bound = obj.getBoundingRect(true, true);
+      if (where === "left") obj.set("left", (obj.left || 0) - bound.left);
+      if (where === "right") obj.set("left", (obj.left || 0) + (cfg.widthPx - bound.left - bound.width));
+      if (where === "top") obj.set("top", (obj.top || 0) - bound.top);
+      if (where === "bottom") obj.set("top", (obj.top || 0) + (cfg.heightPx - bound.top - bound.height));
+      if (where === "hcenter") obj.set("left", (obj.left || 0) + (cfg.widthPx / 2 - (bound.left + bound.width / 2)));
+      if (where === "vcenter") obj.set("top", (obj.top || 0) + (cfg.heightPx / 2 - (bound.top + bound.height / 2)));
+      if (where === "center") {
+        obj.set("left", (obj.left || 0) + (cfg.widthPx / 2 - (bound.left + bound.width / 2)));
+        obj.set("top", (obj.top || 0) + (cfg.heightPx / 2 - (bound.top + bound.height / 2)));
+      }
+      obj.setCoords();
+      c.renderAll();
+      pushHistory(c);
+    };
+
     const nudge = (e: Event) => {
       const { dx, dy } = (e as CustomEvent).detail as { dx: number; dy: number };
       const objs = c.getActiveObjects();
@@ -578,6 +640,8 @@ img{max-width:min(96vw,900px);max-height:92vh;border-radius:12px;box-shadow:0 16
       ["editor:force-json", forceSaveJson as EventListener],
       ["editor:load-json", loadJson as EventListener],
       ["editor:nudge", nudge as EventListener],
+      ["editor:set-position", setPosition as EventListener],
+      ["editor:align", alignOnCanvas as EventListener],
     ];
     list.forEach(([n, h]) => window.addEventListener(n, h));
 

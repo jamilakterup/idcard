@@ -18,6 +18,8 @@ import { IdCanvas } from "@/components/editor/id-canvas";
 import { SizeSetup } from "@/components/editor/size-setup";
 import { useEditorStore, EditorTool } from "@/stores/editor-store";
 import { templateService } from "@/services/template.service";
+import { uploadImageFile, persistFabricImageSources } from "@/lib/upload";
+import { extractFieldsFromDesign } from "@/lib/bulk/mapping";
 import { FONT_FAMILIES } from "@/lib/editor/constants";
 import { cn } from "@/lib/utils";
 import QRCode from "qrcode";
@@ -74,66 +76,89 @@ export default function CreatePage() {
   const router = useRouter();
   const [loadingTemplate, setLoadingTemplate] = useState(false);
 
-  // Load existing template for Edit or Use
+  // Single reliable load path for Edit/Use — set JSON before mounting canvas
   useEffect(() => {
     const tid = searchParams.get("template") || searchParams.get("use");
     const isUse = !!searchParams.get("use");
-    if (!tid || !setupDone) return;
+    if (!tid) return;
+    if (setupDone && templateId === tid && !isUse) return;
+    if (setupDone && isUse && templateName.includes("(copy)")) return;
 
     let cancelled = false;
     (async () => {
       setLoadingTemplate(true);
+      setHydrating(true);
+      setHydrateError(null);
       try {
         const res = await templateService.getById(tid);
         const tpl = res.data?.template;
         if (!tpl || cancelled) return;
 
-        setTemplateId(isUse ? null : tpl._id); // Use = new copy, Edit = same id
-        setTemplateName(isUse ? `${tpl.templateName} (copy)` : tpl.templateName);
+        const cc = (tpl.canvasConfig || {}) as {
+          widthPx?: number; heightPx?: number; widthMm?: number; heightMm?: number;
+          dpi?: number; orientation?: string; unit?: string; preset?: string;
+        };
 
-        if (tpl.canvasConfig && typeof tpl.canvasConfig === "object") {
-          const cc = tpl.canvasConfig as {
-            widthPx?: number; heightPx?: number; widthMm?: number; heightMm?: number;
-            dpi?: number; orientation?: string; unit?: string;
-          };
-          // canvas size already set from setup — if config exists, could re-apply
+        if (cc.widthPx && cc.heightPx) {
+          useEditorStore.getState().setCanvas({
+            widthPx: cc.widthPx,
+            heightPx: cc.heightPx,
+            widthMm: cc.widthMm || 85.6,
+            heightMm: cc.heightMm || 53.98,
+            dpi: cc.dpi || 300,
+            orientation: (cc.orientation as "landscape" | "portrait" | "custom") || "portrait",
+            unit: (cc.unit as "mm" | "px" | "cm" | "in") || "mm",
+            preset: cc.preset || "custom",
+          });
         }
 
-        const front = tpl.frontDesign ? JSON.stringify(tpl.frontDesign) : null;
-        const back = tpl.backDesign ? JSON.stringify(tpl.backDesign) : null;
-        if (front) setSideJson("front", front);
-        if (back) setSideJson("back", back);
+        const front = tpl.frontDesign && Object.keys(tpl.frontDesign).length
+          ? JSON.stringify(tpl.frontDesign)
+          : null;
+        const back = tpl.backDesign && Object.keys(tpl.backDesign).length
+          ? JSON.stringify(tpl.backDesign)
+          : null;
 
-        // Load into fabric
-        await new Promise<void>((resolve) => {
-          window.dispatchEvent(
-            new CustomEvent("editor:load-json", {
-              detail: { json: front || "{}", resolve },
-            })
+        // Critical: write JSON into store BEFORE setupDone so IdCanvas mounts with data
+        if (front) {
+          useEditorStore.getState().initSideHistory("front", front);
+        }
+        if (back) {
+          useEditorStore.getState().initSideHistory("back", back);
+        } else {
+          useEditorStore.getState().initSideHistory(
+            "back",
+            JSON.stringify({ version: "5.3.0", objects: [], background: "#ffffff" })
           );
-          setTimeout(() => resolve(), 800);
-        });
-
-        if (Array.isArray(tpl.elements)) {
-          // restore dynamic fields if strings
-          // skip if complex
         }
-        toast.success(isUse ? "Template loaded — save as new" : "Template loaded for editing");
-        // clear query so refresh doesn't reload
+
+        setTemplateId(isUse ? null : tpl._id);
+        setTemplateName(isUse ? `${tpl.templateName} (copy)` : tpl.templateName);
+        useEditorStore.getState().setSide("front");
+        useEditorStore.getState().syncDynamicFieldsFromDesigns(front, back);
+        useEditorStore.getState().setSetupDone(true);
+        toast.success(isUse ? "Template loaded as copy" : "Template loaded for editing");
         router.replace("/create");
       } catch (err) {
         console.error(err);
+        setHydrateError("Failed to load template. It may have been deleted.");
         toast.error("Failed to load template");
       } finally {
-        if (!cancelled) setLoadingTemplate(false);
+        if (!cancelled) {
+          setLoadingTemplate(false);
+          setHydrating(false);
+        }
       }
     })();
-    return () => { cancelled = true; };
+
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setupDone, searchParams]);
+  }, [searchParams]);
 
 
-  const applyTextStyle = (partial: Partial<typeof textStyle> & { text?: string }) => {
+  const applyTextStyle = (partial: Partial<typeof textStyle> & { text?: string; defaultText?: string; fieldTitle?: string; isDynamic?: boolean }) => {
     if (partial.text !== undefined) setSelectedText(partial.text);
     setTextStyle(partial);
     window.dispatchEvent(new CustomEvent("editor:apply-style", { detail: partial }));
@@ -146,7 +171,9 @@ export default function CreatePage() {
         const dataUrl = await QRCode.toDataURL(qrText || "ID Studio", {
           width: 256, margin: 1, color: { dark: "#000000", light: "#ffffff" },
         });
-        window.dispatchEvent(new CustomEvent("editor:add-qr", { detail: { dataUrl } }));
+        window.dispatchEvent(new CustomEvent("editor:add-qr", {
+          detail: { dataUrl, content: qrText, fieldTitle: "QR" },
+        }));
       } catch { toast.error("QR failed"); }
       return;
     }
@@ -164,17 +191,31 @@ export default function CreatePage() {
   const handleImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f?.type.startsWith("image/")) return;
-    const dataUrl = await readDataUrl(f);
-    window.dispatchEvent(new CustomEvent("editor:add-image", { detail: { dataUrl } }));
+    try {
+      toast.info("Uploading image…");
+      const url = await uploadImageFile(f);
+      const abs = url.startsWith("http") ? url : `${window.location.origin}${url}`;
+      window.dispatchEvent(new CustomEvent("editor:add-image", { detail: { dataUrl: abs } }));
+      toast.success("Image added");
+    } catch (err) {
+      console.error(err);
+      toast.error(err instanceof Error ? err.message : "Upload failed");
+    }
     e.target.value = "";
   };
 
   const handleBg = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f?.type.startsWith("image/")) { toast.error("Image only — use PDF button for PDF"); return; }
-    const dataUrl = await readDataUrl(f);
-    window.dispatchEvent(new CustomEvent("editor:set-bg", { detail: { dataUrl } }));
-    toast.success("Background applied");
+    try {
+      toast.info("Uploading background…");
+      const url = await uploadImageFile(f);
+      const abs = url.startsWith("http") ? url : `${window.location.origin}${url}`;
+      window.dispatchEvent(new CustomEvent("editor:set-bg", { detail: { dataUrl: abs } }));
+      toast.success("Background applied");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Upload failed");
+    }
     e.target.value = "";
   };
 
@@ -193,9 +234,18 @@ export default function CreatePage() {
       el.width = viewport.width;
       el.height = viewport.height;
       await page.render({ canvasContext: el.getContext("2d")!, viewport, canvas: el }).promise;
+      // Upload rendered PNG so it persists
       const dataUrl = el.toDataURL("image/png");
-      window.dispatchEvent(new CustomEvent("editor:set-bg", { detail: { dataUrl } }));
-      toast.success("PDF background applied — now add text fields, then Save");
+      try {
+        const permanent = await uploadImageFile(
+          new File([await (await fetch(dataUrl)).blob()], "bg-pdf.png", { type: "image/png" })
+        );
+        const abs = permanent.startsWith("http") ? permanent : `${window.location.origin}${permanent}`;
+        window.dispatchEvent(new CustomEvent("editor:set-bg", { detail: { dataUrl: abs } }));
+      } catch {
+        window.dispatchEvent(new CustomEvent("editor:set-bg", { detail: { dataUrl } }));
+      }
+      toast.success("PDF background applied");
     } catch (err) {
       console.error(err);
       toast.error("PDF render failed");
@@ -225,8 +275,16 @@ export default function CreatePage() {
         try { return JSON.parse(s); } catch { return {}; }
       };
 
+      toast.info("Saving images & template…");
+      let frontDesign = parseSafe(front);
+      let backDesign = parseSafe(back);
+      try {
+        frontDesign = await persistFabricImageSources(frontDesign);
+        backDesign = await persistFabricImageSources(backDesign);
+      } catch (e) {
+        console.warn("Image persist partial", e);
+      }
 
-      // Thumbnail for My Templates grid
       const thumbnail: string = await new Promise((resolve) => {
         window.dispatchEvent(
           new CustomEvent("editor:export-png", {
@@ -236,11 +294,18 @@ export default function CreatePage() {
         setTimeout(() => resolve(""), 2000);
       });
 
+      const autoFields = [
+        ...extractFieldsFromDesign(frontDesign, "front"),
+        ...extractFieldsFromDesign(backDesign, "back"),
+      ]
+        .filter((f) => f.isDynamic)
+        .map((f) => f.fieldTitle);
+
       const payload = {
         templateName: templateName.trim(),
-        frontDesign: parseSafe(front),
-        backDesign: parseSafe(back),
-        elements: dynamicFields,
+        frontDesign,
+        backDesign,
+        elements: Array.from(new Set(autoFields)),
         canvasConfig: {
           widthPx: canvas.widthPx,
           heightPx: canvas.heightPx,
@@ -273,17 +338,45 @@ export default function CreatePage() {
     }
   };
 
+  const downloadPng = () => {
+    window.dispatchEvent(
+      new CustomEvent("editor:export-png", {
+        detail: {
+          rounded: true,
+          resolve: (url: string) => {
+            if (!url) return;
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `${templateName || "id-card"}-${side}.png`;
+            a.click();
+          },
+        },
+      })
+    );
+  };
+
   const downloadDemoCsv = () => {
-    const headers = dynamicFields.length ? dynamicFields : ["name", "id", "email"];
-    const sample = headers.map((h, i) => (i === 0 ? "John Doe" : i === 1 ? "STU-001" : `sample_${h}`));
-    const csv = [headers.join(","), sample.join(",")].join("\n");
+    const frontFields = extractFieldsFromDesign(
+      frontJson ? JSON.parse(frontJson) : {},
+      "front"
+    ).filter((f) => f.isDynamic);
+    const backFields = extractFieldsFromDesign(
+      backJson ? JSON.parse(backJson) : {},
+      "back"
+    ).filter((f) => f.isDynamic);
+    const headers = Array.from(
+      new Set([...frontFields, ...backFields].map((f) => f.fieldTitle))
+    );
+    const cols = headers.length ? headers : ["Name", "ID", "Email"];
+    const sample = cols.map((h, i) => (i === 0 ? "John Doe" : i === 1 ? "STU-001" : `sample_${h}`));
+    const csv = [cols.join(","), sample.join(",")].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "id-studio-demo.csv";
     a.click();
     URL.revokeObjectURL(a.href);
-    toast.success("Demo CSV downloaded — fill rows and upload");
+    toast.success("Demo CSV downloaded");
   };
 
   const handleExcel = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -349,80 +442,23 @@ export default function CreatePage() {
     }
   };
 
-  const downloadPng = () => {
-    window.dispatchEvent(
-      new CustomEvent("editor:export-png", {
-        detail: {
-          rounded: true,
-          resolve: (url: string) => {
-            if (!url) return;
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = `${templateName || "id-card"}-${side}.png`;
-            a.click();
-          },
-        },
-      })
-    );
-  };
 
-  // If opening Edit/Use, skip size setup after we kick loading
-  useEffect(() => {
-    const tid = searchParams.get("template") || searchParams.get("use");
-    if (!tid || setupDone) return;
-    (async () => {
-      try {
-        const res = await templateService.getById(tid);
-        const tpl = res.data?.template;
-        if (!tpl) return;
-        const cc = (tpl.canvasConfig || {}) as {
-          widthPx?: number; heightPx?: number; widthMm?: number; heightMm?: number;
-          dpi?: number; orientation?: string; unit?: string; preset?: string;
-        };
-        if (cc.widthPx && cc.heightPx) {
-          useEditorStore.getState().setCanvas({
-            widthPx: cc.widthPx,
-            heightPx: cc.heightPx,
-            widthMm: cc.widthMm || 85.6,
-            heightMm: cc.heightMm || 53.98,
-            dpi: cc.dpi || 300,
-            orientation: (cc.orientation as "landscape" | "portrait" | "custom") || "portrait",
-            unit: (cc.unit as "mm" | "px" | "cm" | "in") || "mm",
-            preset: cc.preset || "custom",
-          });
-        }
-        useEditorStore.getState().setSetupDone(true);
-      } catch {
-        // fall through to normal size setup
-      }
-    })();
-  }, [searchParams, setupDone]);
-
-  if (!setupDone) {
-    return (
-      <div className="flex h-full flex-col overflow-hidden">
-        <Header title="ID Card Editor" />
-        <div className="flex-1 overflow-y-auto">
-          <SizeSetup onDone={() => {}} />
-        </div>
-      </div>
-    );
-  }
-
+    const loadTid = searchParams.get("template") || searchParams.get("use");
   const isText = selectedType === "i-text" || selectedType === "text";
   const isImage = selectedType === "image";
   const isShape = selectedType === "rect" || selectedType === "circle" || selectedType === "line";
 
-  if (loadingTemplate || isHydrating) {
+  // Edit/Use: show skeleton until JSON is in the store and setupDone
+  if (loadTid && (loadingTemplate || isHydrating || !setupDone)) {
     return (
       <div className="flex h-full flex-col overflow-hidden">
         <Header title="ID Card Editor" />
         <div className="flex flex-1 flex-col items-center justify-center gap-3 bg-background">
           <div className="h-10 w-10 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-          <p className="text-sm text-muted-foreground">Loading template…</p>
-          <div className="mt-4 w-48 space-y-2">
+          <p className="text-sm text-muted-foreground">Loading saved design…</p>
+          <div className="mt-4 w-56 space-y-2">
             <div className="h-3 rounded bg-muted animate-pulse" />
-            <div className="h-24 rounded bg-muted animate-pulse" />
+            <div className="h-28 rounded bg-muted animate-pulse" />
             <div className="h-3 w-2/3 rounded bg-muted animate-pulse" />
           </div>
         </div>
@@ -435,6 +471,17 @@ export default function CreatePage() {
       <div className="flex h-full flex-col items-center justify-center gap-3 p-8">
         <p className="text-destructive">{hydrateError}</p>
         <Button onClick={() => { setHydrateError(null); router.push("/templates"); }}>Back to templates</Button>
+      </div>
+    );
+  }
+
+  if (!setupDone) {
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        <Header title="ID Card Editor" />
+        <div className="flex-1 overflow-y-auto">
+          <SizeSetup onDone={() => {}} />
+        </div>
       </div>
     );
   }
@@ -738,6 +785,76 @@ export default function CreatePage() {
               </div>
             )}
 
+
+            {/* Position X Y W H — canvas coordinates */}
+            {selectedId && (
+              <div className="space-y-2 border-t border-border pt-2">
+                <p className="text-xs font-medium text-muted-foreground">Position & size</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {(["left", "top", "width", "height"] as const).map((key) => (
+                    <div key={key} className="space-y-0.5">
+                      <Label className="text-[10px] uppercase text-muted-foreground">
+                        {key === "left" ? "X" : key === "top" ? "Y" : key === "width" ? "W" : "H"}
+                      </Label>
+                      <Input
+                        className="h-8 text-xs"
+                        type="number"
+                        placeholder={key}
+                        onFocus={(e) => {
+                          // seed from active object via export is hard; user types values
+                          e.target.select();
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key !== "Enter") return;
+                          const v = parseFloat((e.target as HTMLInputElement).value);
+                          if (Number.isNaN(v)) return;
+                          window.dispatchEvent(
+                            new CustomEvent("editor:set-position", {
+                              detail: { [key]: v },
+                            })
+                          );
+                        }}
+                        onBlur={(e) => {
+                          const v = parseFloat(e.target.value);
+                          if (Number.isNaN(v)) return;
+                          window.dispatchEvent(
+                            new CustomEvent("editor:set-position", {
+                              detail: { [key]: v },
+                            })
+                          );
+                        }}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[10px] text-muted-foreground">Enter + blur applies. Arrow keys nudge 1px (Shift=10).</p>
+                <div className="grid grid-cols-3 gap-1">
+                  {[
+                    ["left", "Left"],
+                    ["hcenter", "H Center"],
+                    ["right", "Right"],
+                    ["top", "Top"],
+                    ["vcenter", "V Center"],
+                    ["bottom", "Bottom"],
+                    ["center", "Center"],
+                  ].map(([id, label]) => (
+                    <Button
+                      key={id}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-[10px] px-1"
+                      onClick={() =>
+                        window.dispatchEvent(new CustomEvent("editor:align", { detail: id }))
+                      }
+                    >
+                      {label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Layers */}
             {selectedId && (
               <div className="space-y-1 border-t border-border pt-2">
@@ -762,34 +879,53 @@ export default function CreatePage() {
               <Input className="h-8 text-xs" value={qrText} onChange={(e) => setQrText(e.target.value)} />
             </div>
 
-            {/* Dynamic fields for bulk */}
+            {/* Auto-detected bulk fields from Field Titles */}
             <div className="space-y-2 border-t border-border pt-2">
-              <p className="text-xs font-medium text-muted-foreground">Bulk fields (CSV headers)</p>
-              <div className="flex flex-wrap gap-1">
-                {dynamicFields.map((f) => (
-                  <span key={f} className="inline-flex items-center gap-0.5 rounded bg-muted px-1.5 py-0.5 text-[11px]">
-                    {`{{${f}}}`}
-                    <button type="button" className="text-muted-foreground hover:text-destructive ml-0.5"
-                      onClick={() => removeDynamicField(f)}>×</button>
-                  </span>
-                ))}
-              </div>
-              <div className="flex gap-1">
-                <Input className="h-8 text-xs" placeholder="new_field" value={newField}
-                  onChange={(e) => setNewField(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && newField.trim()) {
-                      addDynamicField(newField);
-                      setNewField("");
-                    }
-                  }} />
-                <Button type="button" size="sm" className="h-8 text-xs" onClick={() => {
-                  if (newField.trim()) { addDynamicField(newField); setNewField(""); }
-                }}>Add</Button>
-              </div>
+              <p className="text-xs font-medium text-muted-foreground">Bulk Fields (Auto Detected)</p>
               <p className="text-[10px] text-muted-foreground">
-                Put {"{{field}}"} in text on the card. Download demo CSV with these headers for bulk.
+                Set Field Title on text/QR/photo elements. Titles register automatically for CSV mapping.
               </p>
+              {(() => {
+                const frontFields = extractFieldsFromDesign(
+                  frontJson ? JSON.parse(frontJson) : {},
+                  "front"
+                ).filter((f) => f.isDynamic);
+                const backFields = extractFieldsFromDesign(
+                  backJson ? JSON.parse(backJson) : {},
+                  "back"
+                ).filter((f) => f.isDynamic);
+                const all = Array.from(
+                  new Set([...frontFields, ...backFields].map((f) => f.fieldTitle))
+                );
+                return (
+                  <div className="space-y-2 text-[11px]">
+                    <div>
+                      <p className="font-medium text-muted-foreground mb-1">FRONT</p>
+                      <div className="flex flex-wrap gap-1">
+                        {frontFields.length ? frontFields.map((f, i) => (
+                          <span key={`f-${f.fieldTitle}-${i}`} className="rounded bg-primary/15 text-primary px-1.5 py-0.5">{f.fieldTitle}</span>
+                        )) : <span className="text-muted-foreground">None</span>}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="font-medium text-muted-foreground mb-1">BACK</p>
+                      <div className="flex flex-wrap gap-1">
+                        {backFields.length ? backFields.map((f, i) => (
+                          <span key={`b-${f.fieldTitle}-${i}`} className="rounded bg-cyan-500/15 text-cyan-600 dark:text-cyan-400 px-1.5 py-0.5">{f.fieldTitle}</span>
+                        )) : <span className="text-muted-foreground">None</span>}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="font-medium text-muted-foreground mb-1">ALL (CSV headers)</p>
+                      <div className="flex flex-wrap gap-1">
+                        {all.length ? all.map((f) => (
+                          <span key={f} className="rounded bg-muted px-1.5 py-0.5">{f}</span>
+                        )) : <span className="text-muted-foreground">Add dynamic Field Titles on elements</span>}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
 
             {showBulk && (
@@ -848,11 +984,17 @@ export default function CreatePage() {
         onChange={async (e) => {
           const f = e.target.files?.[0];
           if (!f) return;
-          const dataUrl = await readDataUrl(f);
-          window.dispatchEvent(
-            new CustomEvent("editor:fill-shape", { detail: { dataUrl } })
-          );
-          toast.success("Image applied inside shape");
+          try {
+            toast.info("Uploading…");
+            const url = await uploadImageFile(f);
+            const abs = url.startsWith("http") ? url : `${window.location.origin}${url}`;
+            window.dispatchEvent(
+              new CustomEvent("editor:fill-shape", { detail: { dataUrl: abs } })
+            );
+            toast.success("Image applied inside shape");
+          } catch (err) {
+            toast.error(err instanceof Error ? err.message : "Upload failed");
+          }
           e.target.value = "";
         }}
       />
