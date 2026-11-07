@@ -75,6 +75,18 @@ export default function CreatePage() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const [loadingTemplate, setLoadingTemplate] = useState(false);
+  /** Card corner radius in px for export/preview (0 = square) */
+  const [cornerRadius, setCornerRadius] = useState(16);
+
+  // When a QR is selected on canvas, fill the QR Content input
+  useEffect(() => {
+    const onQrSelected = (e: Event) => {
+      const content = (e as CustomEvent).detail?.content;
+      if (typeof content === "string" && content) setQrText(content);
+    };
+    window.addEventListener("editor:qr-selected", onQrSelected);
+    return () => window.removeEventListener("editor:qr-selected", onQrSelected);
+  }, []);
 
   // Single reliable load path for Edit/Use — set JSON before mounting canvas
   useEffect(() => {
@@ -288,7 +300,7 @@ export default function CreatePage() {
       const thumbnail: string = await new Promise((resolve) => {
         window.dispatchEvent(
           new CustomEvent("editor:export-png", {
-            detail: { rounded: true, resolve },
+            detail: { rounded: cornerRadius > 0, radiusPx: cornerRadius, resolve },
           })
         );
         setTimeout(() => resolve(""), 2000);
@@ -342,7 +354,8 @@ export default function CreatePage() {
     window.dispatchEvent(
       new CustomEvent("editor:export-png", {
         detail: {
-          rounded: true,
+          rounded: cornerRadius > 0,
+          radiusPx: cornerRadius,
           resolve: (url: string) => {
             if (!url) return;
             const a = document.createElement("a");
@@ -401,7 +414,7 @@ export default function CreatePage() {
       const png: string = await new Promise((resolve) => {
         window.dispatchEvent(
           new CustomEvent("editor:export-png", {
-            detail: { rounded: true, resolve },
+            detail: { rounded: cornerRadius > 0, radiusPx: cornerRadius, resolve },
           })
         );
         setTimeout(() => resolve(""), 2500);
@@ -530,7 +543,31 @@ export default function CreatePage() {
               <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setZoom(Math.min(200, zoom + 10))}><ZoomIn className="h-3.5 w-3.5" /></Button>
               <Button variant="ghost" size="icon" className="h-8 w-8" disabled={!canUndo} onClick={() => window.dispatchEvent(new Event("editor:undo"))}><Undo className="h-3.5 w-3.5" /></Button>
               <Button variant="ghost" size="icon" className="h-8 w-8" disabled={!canRedo} onClick={() => window.dispatchEvent(new Event("editor:redo"))}><Redo className="h-3.5 w-3.5" /></Button>
-              <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => window.dispatchEvent(new Event("editor:preview"))}>
+              <div className="flex items-center gap-1.5 px-1" title="Card corner radius">
+                <span className="text-[10px] text-muted-foreground whitespace-nowrap">Radius</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={48}
+                  step={1}
+                  value={cornerRadius}
+                  onChange={(e) => setCornerRadius(parseInt(e.target.value, 10))}
+                  className="w-16 accent-primary h-1"
+                />
+                <span className="text-[10px] text-muted-foreground w-6 tabular-nums">{cornerRadius}</span>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                onClick={() =>
+                  window.dispatchEvent(
+                    new CustomEvent("editor:preview", {
+                      detail: { rounded: cornerRadius > 0, radiusPx: cornerRadius },
+                    })
+                  )
+                }
+              >
                 <Eye className="mr-1 h-3 w-3" />Preview
               </Button>
               <Button variant="outline" size="sm" className="h-8 text-xs" onClick={downloadPng}>
@@ -876,7 +913,58 @@ export default function CreatePage() {
 
             <div className="space-y-1 border-t border-border pt-2">
               <Label className="text-xs">QR Content</Label>
-              <Input className="h-8 text-xs" value={qrText} onChange={(e) => setQrText(e.target.value)} />
+              <Input
+                className="h-8 text-xs"
+                value={qrText}
+                onChange={(e) => setQrText(e.target.value)}
+                placeholder="https://yoursite.com or any text"
+              />
+              <div className="flex gap-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-[11px] flex-1"
+                  onClick={async () => {
+                    try {
+                      const dataUrl = await QRCode.toDataURL(qrText || "ID Studio", {
+                        width: 256,
+                        margin: 1,
+                        color: { dark: "#000000", light: "#ffffff" },
+                      });
+                      window.dispatchEvent(
+                        new CustomEvent("editor:update-qr", {
+                          detail: { dataUrl, content: qrText },
+                        })
+                      );
+                      toast.success("Selected QR updated");
+                    } catch {
+                      toast.error("QR update failed — select a QR first");
+                    }
+                  }}
+                >
+                  Update selected QR
+                </Button>
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                Type your link/text, then click QR tool to add, or select an existing QR and Update.
+              </p>
+            </div>
+
+            <div className="space-y-1 border-t border-border pt-2">
+              <p className="text-xs font-medium text-muted-foreground">Background</p>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-7 text-[11px] w-full"
+                onClick={() => window.dispatchEvent(new Event("editor:clear-bg"))}
+              >
+                Clear background (PDF / image)
+              </Button>
+              <p className="text-[10px] text-muted-foreground">
+                BG image/PDF is selectable — select it and press Delete, or use Clear.
+              </p>
             </div>
 
             {/* Auto-detected bulk fields from Field Titles */}

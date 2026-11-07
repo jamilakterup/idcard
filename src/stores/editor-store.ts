@@ -38,6 +38,8 @@ export interface SelectedMeta {
   fieldTitle: string;
   isDynamic: boolean;
   defaultText: string;
+  isQr?: boolean;
+  qrContent?: string;
 }
 
 interface SideHistory {

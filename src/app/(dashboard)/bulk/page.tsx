@@ -89,6 +89,12 @@ export default function BulkPage() {
   }, [mode]);
 
   useEffect(() => {
+    if (rows.length && Object.keys(photoMap).length) {
+      computePhotoMatches(rows, headers, photoMap, mapping);
+    }
+  }, [rows, headers, photoMap, mapping]);
+
+  useEffect(() => {
     if (step !== 5 || !selected || !rows[previewIdx]) {
       setPreviewUrl(null);
       return;
@@ -137,11 +143,79 @@ export default function BulkPage() {
       setHeaders(Object.keys(data[0]));
       setRows(data);
       setFileName(file.name);
-      setStep(3);
-      toast.success(`${data.length} rows loaded`);
+      // Stay on step 2 so user can upload photos and see match results before Next
+      toast.success(`${data.length} rows loaded — upload photos below if needed`);
     } catch {
       toast.error("Failed to parse file");
     }
+  };
+
+  const computePhotoMatches = (
+    rowData: Record<string, string>[],
+    csvHeaders: string[],
+    map: Record<string, string>,
+    fieldMap: Record<string, string | null>
+  ) => {
+    const photoCol =
+      fieldMap["Photo"] ||
+      fieldMap["photo"] ||
+      fieldMap["PHOTO"] ||
+      csvHeaders.find((h) => /photo|image|picture|pic/i.test(h)) ||
+      null;
+
+    const needed = new Set<string>();
+    let matched = 0;
+    let missing = 0;
+    const missingList: string[] = [];
+
+    if (photoCol) {
+      for (const row of rowData) {
+        const raw = String(row[photoCol] ?? "").trim();
+        if (!raw) {
+          missing++;
+          missingList.push("(empty)");
+          continue;
+        }
+        const key = raw.toLowerCase().replace(/\s+/g, "");
+        const keyNoExt = key.replace(/\.(jpe?g|png|webp|gif)$/i, "");
+        if (map[key] || map[keyNoExt]) {
+          matched++;
+          needed.add(key);
+          needed.add(keyNoExt);
+        } else {
+          missing++;
+          missingList.push(raw);
+        }
+      }
+    }
+
+    // Extra = photo keys that are not referenced by any row (count unique base names)
+    const photoBases = new Set<string>();
+    for (const k of Object.keys(map)) {
+      const base = k.replace(/\.(jpe?g|png|webp|gif)$/i, "");
+      photoBases.add(base);
+    }
+    let extra = 0;
+    const extraList: string[] = [];
+    for (const base of photoBases) {
+      if (!needed.has(base) && !needed.has(base + ".jpg") && !needed.has(base + ".jpeg") && !needed.has(base + ".png")) {
+        // check if any needed key matches this base
+        let used = false;
+        for (const n of needed) {
+          if (n === base || n.replace(/\.(jpe?g|png|webp|gif)$/i, "") === base) {
+            used = true;
+            break;
+          }
+        }
+        if (!used) {
+          extra++;
+          extraList.push(base);
+        }
+      }
+    }
+
+    setPhotoMatchStats({ matched, missing, extra });
+    return { matched, missing, extra, missingList: missingList.slice(0, 20), extraList: extraList.slice(0, 20), photoCol };
   };
 
   const downloadSample = () => {
@@ -425,7 +499,10 @@ export default function BulkPage() {
                           }
                         }
                         setPhotoMap(map);
-                        toast.success(`${Object.keys(map).length} photo keys ready`);
+                        const stats = computePhotoMatches(rows, headers, map, mapping);
+                        toast.success(
+                          `${Object.keys(map).length} photo keys ready · matched ${stats.matched}, missing ${stats.missing}`
+                        );
                       } catch (err) {
                         console.error(err);
                         toast.error("Photo load failed");
@@ -435,9 +512,32 @@ export default function BulkPage() {
                   />
                 </label>
                 {(zipName || Object.keys(photoMap).length > 0) && (
-                  <p className="text-xs text-muted-foreground">
-                    {zipName || "Photos"} · {Object.keys(photoMap).length} keys
-                  </p>
+                  <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3 text-sm">
+                    <p className="text-xs text-muted-foreground">
+                      {zipName || "Photos"} · {Object.keys(photoMap).length} keys loaded
+                    </p>
+                    <div className="flex flex-wrap gap-3 text-xs">
+                      <span className="font-medium text-green-600 dark:text-green-400">
+                        Matched: {photoMatchStats.matched}
+                      </span>
+                      <span className="font-medium text-amber-600 dark:text-amber-400">
+                        Missing: {photoMatchStats.missing}
+                      </span>
+                      <span className="font-medium text-muted-foreground">
+                        Extra: {photoMatchStats.extra}
+                      </span>
+                    </div>
+                    {photoMatchStats.missing > 0 && (
+                      <p className="text-[11px] text-amber-700 dark:text-amber-300">
+                        Some CSV rows have no matching photo filename. Check Photo column vs uploaded names.
+                      </p>
+                    )}
+                    {photoMatchStats.matched === 0 && rows.length > 0 && Object.keys(photoMap).length > 0 && (
+                      <p className="text-[11px] text-destructive">
+                        No matches. Filenames must match the Photo column value (e.g. jamil.jpg or jamil).
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
 

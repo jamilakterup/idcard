@@ -112,32 +112,8 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
           isRestoringRef.current = false;
           finishInit(serialize(fc!));
         });
-      } else if (!blank) {
-        const W = cfg.widthPx;
-        const H = cfg.heightPx;
-        const nameT = new fabric.IText("Your Name", {
-          left: Math.round(W * 0.08),
-          top: Math.round(H * 0.55),
-          fontSize: Math.max(14, Math.round(H * 0.04)),
-          fill: "#111111",
-          fontFamily: "Inter, system-ui, sans-serif",
-          fontWeight: "bold",
-          name: "field-name",
-          data: { fieldTitle: "Name", isDynamic: true, defaultText: "Your Name" },
-        });
-        const idT = new fabric.IText("ID-001", {
-          left: Math.round(W * 0.08),
-          top: Math.round(H * 0.65),
-          fontSize: Math.max(12, Math.round(H * 0.028)),
-          fill: "#334155",
-          fontFamily: "Inter, system-ui, sans-serif",
-          name: "field-id",
-          data: { fieldTitle: "ID", isDynamic: true, defaultText: "ID-001" },
-        });
-        fc.add(nameT, idT);
-        fc.renderAll();
-        finishInit(serialize(fc));
       } else {
+        // Blank canvas — no demo "Your Name" / "ID-001" text
         fc.renderAll();
         finishInit(serialize(fc));
       }
@@ -152,14 +128,22 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
           fontFamily?: string; fontSize?: number;
           fontWeight?: string | number; fontStyle?: string;
           fill?: string; textAlign?: string; underline?: boolean; opacity?: number;
-          data?: { fieldTitle?: string; isDynamic?: boolean; defaultText?: string };
+          data?: { fieldTitle?: string; isDynamic?: boolean; defaultText?: string; isQr?: boolean; qrContent?: string };
         };
         const textVal = typeof o.text === "string" ? o.text : "";
         setSelected(o.name || "obj", o.type || null, textVal, {
           fieldTitle: o.data?.fieldTitle || "",
           isDynamic: o.data?.isDynamic !== false,
           defaultText: o.data?.defaultText || textVal,
+          isQr: !!o.data?.isQr,
+          qrContent: o.data?.qrContent || "",
         });
+        // Notify UI when a QR is selected so QR Content field can show its value
+        if (o.data?.isQr && o.data.qrContent) {
+          window.dispatchEvent(
+            new CustomEvent("editor:qr-selected", { detail: { content: o.data.qrContent } })
+          );
+        }
         if (o.type === "i-text" || o.type === "text") {
           setTextStyle({
             fontFamily: o.fontFamily || "Inter, system-ui, sans-serif",
@@ -242,7 +226,7 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
         | { fieldTitle?: string; defaultText?: string; isDynamic?: boolean }
         | undefined;
       const fieldTitle = detail?.fieldTitle || "Name";
-      const defaultText = detail?.defaultText || "Your Name";
+      const defaultText = detail?.defaultText || "Text";
       const isDynamic = detail?.isDynamic !== false;
       const t = new fabric.IText(defaultText, {
         left: cfg.widthPx / 2 - 80,
@@ -325,18 +309,66 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
     const setBg = async (e: Event) => {
       const { dataUrl } = (e as CustomEvent).detail as { dataUrl: string };
       const { fabric } = await import("fabric");
+      // Remove previous bg objects so only one full-card background remains
+      c.getObjects().filter((o) => (o as FabricObject & { name?: string }).name === "bg-image").forEach((o) => c.remove(o));
+      c.setBackgroundImage(null as unknown as import("fabric").fabric.Image, () => {});
       fabric.Image.fromURL(dataUrl, (img) => {
         img.set({
           scaleX: cfg.widthPx / (img.width || 1),
           scaleY: cfg.heightPx / (img.height || 1),
-          originX: "left", originY: "top",
-          selectable: false, evented: false,
+          originX: "left",
+          originY: "top",
+          left: 0,
+          top: 0,
+          selectable: true,
+          evented: true,
+          name: "bg-image",
+          data: { isBackground: true },
         });
-        c.setBackgroundImage(img, () => {
-          c.renderAll();
-          pushHistory(c);
-        });
+        c.add(img);
+        c.sendToBack(img);
+        c.setActiveObject(img);
+        c.renderAll();
+        pushHistory(c);
       }, { crossOrigin: "anonymous" });
+    };
+
+    const clearBg = () => {
+      c.getObjects().filter((o) => (o as FabricObject & { name?: string }).name === "bg-image").forEach((o) => c.remove(o));
+      c.setBackgroundImage(null as unknown as import("fabric").fabric.Image, () => {
+        c.discardActiveObject();
+        c.renderAll();
+        pushHistory(c);
+      });
+    };
+
+    const updateQr = async (e: Event) => {
+      const detail = (e as CustomEvent).detail as { dataUrl: string; content?: string };
+      const obj = c.getActiveObject() as (FabricObject & { data?: { isQr?: boolean }; type?: string }) | undefined;
+      if (!obj || obj.type !== "image" || !obj.data?.isQr) return;
+      const { fabric } = await import("fabric");
+      fabric.Image.fromURL(detail.dataUrl, (img) => {
+        const w = (obj.width || 1) * (obj.scaleX || 1);
+        const h = (obj.height || 1) * (obj.scaleY || 1);
+        img.set({
+          left: obj.left,
+          top: obj.top,
+          scaleX: w / (img.width || 1),
+          scaleY: h / (img.height || 1),
+          angle: obj.angle || 0,
+          name: obj.name,
+          data: {
+            ...(obj.data || {}),
+            isQr: true,
+            qrContent: detail.content || "",
+          },
+        });
+        c.remove(obj);
+        c.add(img);
+        c.setActiveObject(img);
+        c.renderAll();
+        pushHistory(c);
+      });
     };
 
     const undo = () => {
@@ -490,16 +522,24 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
     const sendBackward = () => { const o = c.getActiveObject(); if (o) { c.sendBackwards(o); c.renderAll(); pushHistory(c); } };
 
     const exportPng = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { resolve: (url: string) => void; rounded?: boolean };
+      const detail = (e as CustomEvent).detail as {
+        resolve: (url: string) => void;
+        rounded?: boolean;
+        radiusPx?: number;
+      };
       const dataUrl = c.toDataURL({ format: "png", multiplier: 1, enableRetinaScaling: false });
-      if (!detail.rounded) { detail.resolve(dataUrl); return; }
+      const radiusPx = detail.radiusPx ?? 0;
+      if (!detail.rounded || radiusPx <= 0) {
+        detail.resolve(dataUrl);
+        return;
+      }
       const img = new Image();
       img.onload = () => {
         const off = document.createElement("canvas");
         off.width = cfg.widthPx;
         off.height = cfg.heightPx;
         const ctx = off.getContext("2d")!;
-        const radius = Math.min(24, Math.min(cfg.widthPx, cfg.heightPx) * 0.04);
+        const radius = Math.min(radiusPx, Math.min(cfg.widthPx, cfg.heightPx) / 2);
         const w = cfg.widthPx, h = cfg.heightPx;
         ctx.beginPath();
         ctx.moveTo(radius, 0);
@@ -520,17 +560,25 @@ export function IdCanvas({ initialJson, blank }: IdCanvasProps) {
       img.src = dataUrl;
     };
 
-    const preview = () => {
+    const preview = (e?: Event) => {
+      const pdetail = (e as CustomEvent | undefined)?.detail as {
+        rounded?: boolean;
+        radiusPx?: number;
+      } | undefined;
+      const radiusPx = pdetail?.radiusPx ?? (pdetail?.rounded === false ? 0 : 16);
+      const useRounded = radiusPx > 0;
       window.dispatchEvent(new CustomEvent("editor:export-png", {
         detail: {
-          rounded: true,
+          rounded: useRounded,
+          radiusPx,
           resolve: (url: string) => {
             if (!url) return;
             const w = window.open("", "_blank");
             if (!w) return;
+            const radiusCss = useRounded ? `border-radius:${Math.min(24, radiusPx)}px;` : "border-radius:0;";
             w.document.write(`<!DOCTYPE html><html><head><title>Preview</title>
 <style>*{margin:0;box-sizing:border-box}body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;padding:24px}
-img{max-width:min(96vw,900px);max-height:92vh;border-radius:12px;box-shadow:0 16px 48px rgba(0,0,0,.5)}</style>
+img{max-width:min(96vw,900px);max-height:92vh;${radiusCss}box-shadow:0 16px 48px rgba(0,0,0,.5)}</style>
 </head><body><img src="${url}" alt="Preview"/></body></html>`);
             w.document.close();
           },
@@ -622,7 +670,9 @@ img{max-width:min(96vw,900px);max-height:92vh;border-radius:12px;box-shadow:0 16
       ["editor:add-line", addLine],
       ["editor:add-image", addImage as EventListener],
       ["editor:add-qr", addQr as EventListener],
+      ["editor:update-qr", updateQr as EventListener],
       ["editor:set-bg", setBg as EventListener],
+      ["editor:clear-bg", clearBg],
       ["editor:undo", undo],
       ["editor:redo", redo],
       ["editor:delete", del],
@@ -667,7 +717,7 @@ img{max-width:min(96vw,900px);max-height:92vh;border-radius:12px;box-shadow:0 16
     if (!ready) return;
     if (tool === "text") {
       window.dispatchEvent(new CustomEvent("editor:add-text", {
-        detail: { fieldTitle: "Name", defaultText: "Your Name", isDynamic: true },
+        detail: { fieldTitle: "", defaultText: "Text", isDynamic: true },
       }));
     }
     if (tool === "rect") window.dispatchEvent(new Event("editor:add-rect"));

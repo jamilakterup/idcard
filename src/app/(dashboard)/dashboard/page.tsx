@@ -76,8 +76,17 @@ export default function DashboardPage() {
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 {stats.recentTemplates.map((t) => (
                   <div key={t._id} className="rounded-lg border border-border p-4 hover:bg-muted/50">
-                    <div className="mb-3 aspect-[1.6/1] rounded-md bg-gradient-to-br from-primary/20 to-cyan-soft/20 flex items-center justify-center">
-                      <CreditCard className="h-8 w-8 text-primary/60" />
+                    <div className="mb-3 aspect-[1.6/1] rounded-md bg-gradient-to-br from-primary/20 to-cyan-soft/20 flex items-center justify-center overflow-hidden">
+                      {t.thumbnail ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={t.thumbnail}
+                          alt={t.templateName}
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <CreditCard className="h-8 w-8 text-primary/60" />
+                      )}
                     </div>
                     <p className="font-medium truncate">{t.templateName}</p>
                     <p className="text-xs text-muted-foreground">{new Date(t.createdAt).toLocaleDateString()}</p>
